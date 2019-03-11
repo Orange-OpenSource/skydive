@@ -22,11 +22,9 @@ package netlink
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"net"
-	"path/filepath"
-	"strconv"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,6 +61,10 @@ type pendingLink struct {
 	metadata     graph.Metadata
 }
 
+type pendingVf struct {
+	intf *graph.Node
+}
+
 // NetNsProbe describes a topology probe based on netlink in a network namespace
 type NetNsProbe struct {
 	common.RWMutex
@@ -79,6 +81,7 @@ type NetNsProbe struct {
 	wg                   sync.WaitGroup
 	quit                 chan bool
 	netNsNameTry         map[graph.Identifier]int
+	sriovProcessor       *graph.Processor
 }
 
 // Probe describes a list NetLink NameSpace probe to enhance the graph
@@ -206,16 +209,24 @@ func (u *NetNsProbe) handleIntfIsVeth(intf *graph.Node, link netlink.Link) {
 	}
 }
 
+/* ProcessNode, the action associated to a pendingVf connects the node of actual
+   virtual to the VF node associated to the physical interface */
+func (pending *pendingVf) ProcessNode(g *graph.Graph, node *graph.Node) bool {
+	if !topology.HaveLayer2Link(g, pending.intf, node) {
+		if _, err := topology.AddLayer2Link(g, pending.intf, node, nil); err != nil {
+			logging.GetLogger().Error(err)
+		}
+	}
+	return false
+}
+
 func (u *NetNsProbe) handleIntfIsVF(intf *graph.Node, link netlink.Link) {
 	attrs := link.Attrs()
 	physfnNetPath := fmt.Sprintf("/sys/class/net/%s/device/physfn/net", attrs.Name)
-	if fileinfos, err := ioutil.ReadDir(physfnNetPath); err == nil {
-		physfnIfIndexPath := filepath.Join(physfnNetPath, fileinfos[0].Name(), "ifindex")
-		if content, err := ioutil.ReadFile(physfnIfIndexPath); err == nil {
-			// The interface is a VF
-			if physfnIfIndex, err := strconv.Atoi(strings.TrimSpace(string(content))); err == nil {
-				u.linkIntfToIndex(intf, int64(physfnIfIndex), "vf", nil)
-			}
+	if _, err := os.Stat(physfnNetPath); !os.IsNotExist(err) {
+		pending := pendingVf{intf: intf}
+		if pciAddress, ok := intf.Metadata["BusInfo"]; ok {
+			u.sriovProcessor.DoAction(&pending, pciAddress)
 		}
 	}
 }
@@ -503,22 +514,6 @@ func (u *NetNsProbe) addLinkToTopology(link netlink.Link) {
 		}
 	}
 
-	if len(attrs.Vfs) > 0 {
-		vfs := make([]interface{}, len(attrs.Vfs))
-		for i, vf := range attrs.Vfs {
-			vfs[i] = map[string]interface{}{
-				"ID":        int64(vf.ID),
-				"LinkState": int64(vf.LinkState),
-				"MAC":       vf.Mac.String(),
-				"Qos":       int64(vf.Qos),
-				"Spoofchk":  vf.Spoofchk,
-				"TxRate":    int64(vf.TxRate),
-				"Vlan":      int64(vf.Vlan),
-			}
-		}
-		metadata["VFS"] = vfs
-	}
-
 	if neighbors := u.getNeighbors(attrs.Index, syscall.AF_BRIDGE); len(*neighbors) > 0 {
 		metadata["FDB"] = neighbors
 	}
@@ -576,6 +571,14 @@ func (u *NetNsProbe) addLinkToTopology(link netlink.Link) {
 		metadata["BondMode"] = link.(*netlink.Bond).Mode.String()
 	}
 
+	businfo, err := u.ethtool.BusInfo(attrs.Name)
+	if err != nil && err != syscall.ENODEV {
+		logging.GetLogger().Errorf(
+			"Unable get Bus Info from ethtool (%s): %s", attrs.Name, err)
+	} else {
+		metadata["BusInfo"] = businfo
+	}
+
 	var intf *graph.Node
 
 	switch driver {
@@ -596,10 +599,13 @@ func (u *NetNsProbe) addLinkToTopology(link netlink.Link) {
 	if intf == nil {
 		return
 	}
-
 	u.Lock()
 	u.links[attrs.Name] = intf
 	u.Unlock()
+
+	if len(attrs.Vfs) > 0 {
+		u.handleSriov(intf, metadata, attrs.Vfs, attrs.Name)
+	}
 
 	u.updateLinkNetNs(intf, link, metadata)
 
@@ -1126,6 +1132,8 @@ func (u *NetNsProbe) closeFds() {
 }
 
 func (u *NetNsProbe) stop() {
+	u.sriovProcessor.Stop()
+
 	if atomic.CompareAndSwapInt64(&u.state, common.RunningState, common.StoppingState) {
 		u.quit <- true
 		u.wg.Wait()
@@ -1134,6 +1142,7 @@ func (u *NetNsProbe) stop() {
 }
 
 func newNetNsProbe(g *graph.Graph, root *graph.Node, nsPath string) (*NetNsProbe, error) {
+	sriovProcessor := graph.NewProcessor(g, g, graph.Metadata{"Type": "sriov-device"}, "BusInfo")
 	probe := &NetNsProbe{
 		Graph:                g,
 		Root:                 root,
@@ -1142,7 +1151,9 @@ func newNetNsProbe(g *graph.Graph, root *graph.Node, nsPath string) (*NetNsProbe
 		links:                make(map[string]*graph.Node),
 		quit:                 make(chan bool),
 		netNsNameTry:         make(map[graph.Identifier]int),
+		sriovProcessor:       sriovProcessor,
 	}
+	sriovProcessor.Start()
 
 	var context *common.NetNSContext
 	var err error
